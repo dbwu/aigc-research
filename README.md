@@ -43,7 +43,7 @@ pnpm start
 3. 选择固定机位、缓慢推进或小幅环绕；拖动时间条或播放预览。运动只作用于当前相机，人物保持站位。
 4. 设置共同的深度近端／远端，选择导出尺寸与帧数，点击「导出当前机位深度视频」。导出使用固定时间采样，不依赖界面实际播放帧率。
 5. 导出完成后下载 MP4 和场景参数，或选择「本地模拟」检查提交、任务状态和视频回传流程。**模拟返回已有深度视频，不是 AI 生成结果。**
-6. 接入真实服务后填写画面描述与可选的外观参考图 URL，再提交外部生成。修改场景、机位、运动或导出参数后，需要重新导出，避免提交旧的控制视频。
+6. 接入生成服务后填写画面描述，再提交视频生成。支持外观参考图的服务会显示对应输入框。修改场景、机位、运动或导出参数后，需要重新导出，避免提交旧的控制视频。
 
 场景会自动保存在当前浏览器的 `localStorage`。顶部「保存场景」导出 JSON，「导入」恢复 JSON，「恢复默认场景」重置当前布局。浏览器场景保存不包含外部密钥，也不等于保存生成任务。
 
@@ -98,6 +98,24 @@ VIDEO_API_KEY=可选的服务密钥
 
 需要提交／轮询的第三方队列，应该在适配器内部处理。浏览器始终通过统一的本地任务接口查询状态。
 
+### 自建 ComfyUI · MiniMax H3 深度控制
+
+1. 在运行 ComfyUI 的机器上打开模板库，加载 **MiniMax H3 Fun ControlNet Union**，在模板中选好本机可用的 H3、VAE、文本编码器和 ControlNet 权重。保留原生 **Load Video**、**MiniMax H3 Reference to Video**、**Apply MiniMax H3 Fun ControlNet** 和 **Save Video**。将 Save Video 的格式设为 MP4、编码设为 H.264，保留 Create Video 的 24 fps。
+2. 在 ComfyUI 选择 **文件 → 导出 (API)**。将 JSON 复制到运行空间片场的机器，放在本项目根目录并命名为 `comfyui-h3.api.json`。API 文件以节点 ID 为键，值包含 `class_type` 和 `inputs`。
+3. 在项目根目录 `.env` 填写 ComfyUI 服务地址并重启空间片场。空间片场的后端需要能访问这个地址，工作流 JSON 放在空间片场所在的机器上即可。
+
+   ```dotenv
+   COMFYUI_URL=http://你的ComfyUI内网地址:8188
+   COMFYUI_WORKFLOW_PATH=./comfyui-h3.api.json
+   ```
+
+   默认自动找唯一的 Load Video 和 Save Video。如有多个，分别用 `COMFYUI_VIDEO_NODE` 和 `COMFYUI_OUTPUT_NODE` 指定 API JSON 中的节点 ID。使用 Bearer 鉴权的反向代理可设置 `COMFYUI_API_KEY`。
+4. 在空间片场导出一个机位的深度视频，选择 **ComfyUI · MiniMax H3**，填写画面描述并点击「提交视频生成」。完成后，生成 MP4 会保存在 `data/generations/`，并出现在页面的视频播放器里。
+
+桥接将深度视频重采样为 24 fps。默认的 81 帧和 161 帧导出分别适配为 124 和 243 帧，尾部不足时补最后一帧。每次只运行选定 Save Video 所需的节点，并把上传视频的帧直接连到 ControlNet。官方模板里用于示例的姿态提取会被跳过，工作流文件可继续在 ComfyUI 编辑。页面传入画面描述，分辨率及模型权重由工作流决定。等待上限为 30 分钟，超时后可在 ComfyUI 队列查看原任务。
+
+[ComfyUI 官方模板说明](https://docs.comfy.org/tutorials/video/minimax/minimax-h3-fun-controlnet) · [自建 API 文档](https://docs.comfy.org/development/comfyui-server/comms_routes)
+
 ### 新增适配器
 
 在 `server/providers.mjs` 的 `createProviders()` 中注册对象，实现 `id`、`name`、`description`、`configured()` 和 `async generate({ exported, input, signal })`。成功时返回 `{ videoUrl }`；失败时抛出错误。`exported.videoPath` 指向本地深度视频，`input` 包含提示词、参考图和 seed。无需修改场景渲染或导出模块。
@@ -114,9 +132,10 @@ VIDEO_API_KEY=可选的服务密钥
 | `server/server.mjs` | 本地 API、文件服务与生成任务管理 |
 | `server/encoder.mjs` | FFmpeg 查找与 MP4 编码 |
 | `server/providers.mjs` | 本地模拟、fal、自定义 HTTP 适配器 |
+| `server/comfyui.mjs` | MiniMax H3 控制工作流、上传、任务查询与结果回传 |
 | `data/exports/<id>/` | `depth.mp4`、`metadata.json`、`frames/00000.png` 等原始帧 |
 
-完成的导出保留在磁盘，服务重启后可以通过 `GET /api/exports` 查询。生成任务状态仅存于服务进程内，重启后不保留；外部结果当前返回服务商 URL，不自动下载归档。浏览器刷新后，需重新导出才能通过当前界面提交下一次生成。
+完成的导出保留在磁盘，服务重启后可以通过 `GET /api/exports` 查询。生成任务状态仅存于服务进程内。ComfyUI 的结果下载到本地，fal 和自定义 HTTP 接口的结果沿用服务商 URL。浏览器刷新后，需重新导出才能通过当前界面提交下一次生成。
 
 ## 检查
 

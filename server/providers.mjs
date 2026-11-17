@@ -99,7 +99,7 @@ export function isHttpUrl(value) {
 
 export function redactError(error, env = process.env) {
   let text = error instanceof Error ? error.message : '任务失败。';
-  for (const key of ['FAL_KEY', 'VIDEO_API_KEY']) {
+  for (const key of ['FAL_KEY', 'VIDEO_API_KEY', 'COMFYUI_API_KEY']) {
     if (env[key]) text = text.split(env[key]).join('[redacted]');
   }
   text = text.replace(/(Bearer|Key)\s+[^\s"'<>]+/gi, '$1 [redacted]');

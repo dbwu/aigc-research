@@ -92,7 +92,7 @@ $('#app').innerHTML = `
       <label class="block-label" for="provider">生成服务</label><select id="provider"><option value="mock">本地模拟 · 无需密钥</option></select>
       <p id="provider-description" class="provider-note">验证任务流程，返回深度预览，不调用生成模型。</p>
       <label class="block-label" for="prompt">画面描述</label><textarea id="prompt" rows="3">明亮的现代房间，两个人站在桌子两侧交谈。保持人物站位、桌子位置和镜头构图，动作自然克制。</textarea>
-      <label class="block-label" for="reference">外观参考图 URL <span>可选</span></label><input id="reference" type="url" placeholder="https://…" autocomplete="off">
+      <div id="reference-fields"><label class="block-label" for="reference">外观参考图 URL <span>可选</span></label><input id="reference" type="url" placeholder="https://…" autocomplete="off"></div>
       <button id="generate" class="secondary-button" disabled>先导出深度视频 ${icon('arrow',16)}</button>
       <div id="generation-result" class="generation-result" hidden></div>
     </aside>
@@ -127,7 +127,7 @@ function updateGenerateButton() {
   const provider = providers.find(item => item.id === $<HTMLSelectElement>('#provider').value);
   const fresh = !!lastExport && signature() === lastExportSignature;
   button.disabled = !fresh || exporting || generating || !provider?.configured;
-  button.innerHTML = `${generating ? '正在处理…' : !fresh ? (lastExport ? '场景已变化，请重新导出' : '先导出深度视频') : !provider?.configured ? '请先配置服务密钥' : provider.id === 'mock' ? '运行本地模拟' : '提交外部生成'} ${icon('arrow', 16)}`;
+  button.innerHTML = `${generating ? '正在处理…' : !fresh ? (lastExport ? '场景已变化，请重新导出' : '先导出深度视频') : !provider?.configured ? '请先配置生成服务' : provider.id === 'mock' ? '运行本地模拟' : '提交视频生成'} ${icon('arrow', 16)}`;
 }
 function selectObject(kind: 'person' | 'camera', id: string) {
   selected = { kind, id };
@@ -287,6 +287,7 @@ $('#export-video').addEventListener('click', async () => {
 
 function updateProvider() {
   const provider = providers.find(item => item.id === $<HTMLSelectElement>('#provider').value);
+  $('#reference-fields').hidden = provider?.acceptsReferenceImage === false;
   $('#provider-description').textContent = provider?.description || '正在读取服务配置'; updateGenerateButton();
 }
 $('#provider').addEventListener('change', updateProvider);
@@ -299,7 +300,7 @@ $('#generate').addEventListener('click', async () => {
   if (!lastExport || exporting || generating || signature() !== lastExportSignature) return;
   const prompt = $<HTMLTextAreaElement>('#prompt').value.trim();
   if (!prompt) { notify('请填写画面描述', true); return; }
-  const referenceImageUrl = $<HTMLInputElement>('#reference').value.trim();
+  const referenceImageUrl = $('#reference-fields').hidden ? '' : $<HTMLInputElement>('#reference').value.trim();
   if (referenceImageUrl) { try { const u = new URL(referenceImageUrl); if (!['https:', 'http:'].includes(u.protocol)) throw new Error(); } catch { notify('参考图需要有效的 HTTP 或 HTTPS 地址', true); return; } }
   generating = true; updateGenerateButton();
   const panel = $('#generation-result'); panel.hidden = false; panel.textContent = '任务提交中…';
@@ -313,7 +314,7 @@ $('#generate').addEventListener('click', async () => {
     if (job.status === 'failed' || !job.videoUrl) throw new Error(job.error || '生成任务失败');
     const videoUrl = safeVideoUrl(job.videoUrl);
     const isMock = job.mock || job.provider === 'mock';
-    panel.innerHTML = `<div class="result-label">${icon('check',14)} ${isMock ? '模拟完成 · 以下是深度预览' : '视频生成完成'}</div><video controls playsinline src="${esc(videoUrl)}"></video><a href="${esc(videoUrl)}" target="_blank" rel="noopener noreferrer">打开视频 ${icon('arrow',12)}</a>${isMock ? '<p>已验证接口与任务流程，未调用外部模型。</p>' : ''}`;
+    panel.innerHTML = `<div class="result-label">${icon('check',14)} ${isMock ? '模拟完成 · 以下是深度预览' : '视频生成完成'}</div><video controls playsinline preload="metadata" src="${esc(videoUrl)}"></video><a href="${esc(videoUrl)}" target="_blank" rel="noopener noreferrer">打开视频 ${icon('arrow',12)}</a>${isMock ? '<p>已验证接口与任务流程，未调用外部模型。</p>' : ''}`;
     notify(isMock ? '本地模拟已完成，未产生模型调用' : '视频生成完成');
   } catch (error) { panel.textContent = (error as Error).message; notify(`任务失败：${(error as Error).message}`, true); }
   finally { generating = false; updateGenerateButton(); }

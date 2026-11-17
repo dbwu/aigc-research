@@ -6,3 +6,4 @@ data/
 !.env.example
 *.log
 .qa/
+comfyui-h3.api.json

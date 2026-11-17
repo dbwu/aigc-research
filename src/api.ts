@@ -3,7 +3,7 @@ export type ExportRecord = {
   cameraId?: string; createdAt?: string; width?: number; height?: number;
   fps?: number; numFrames?: number;
 };
-export type Provider = { id: string; name: string; configured: boolean; description: string };
+export type Provider = { id: string; name: string; configured: boolean; description: string; acceptsReferenceImage?: boolean };
 export type GenerationJob = { id: string; status: string; provider: string; videoUrl?: string; error?: string; mock?: boolean };
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

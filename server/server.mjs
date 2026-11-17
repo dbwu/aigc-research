@@ -5,6 +5,7 @@ import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { createProviders, isHttpUrl, redactError } from './providers.mjs';
+import { createComfyUIProvider } from './comfyui.mjs';
 import { resolveFfmpeg, checkFfmpeg, encodeVideo } from './encoder.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -102,10 +103,13 @@ export async function createAppServer(options = {}) {
   const env = options.env || process.env;
   const dataDir = resolve(options.dataDir || join(root, 'data'));
   const exportDir = join(dataDir, 'exports');
+  const generationDir = join(dataDir, 'generations');
   const distDir = resolve(options.distDir || join(root, 'dist'));
   const ffmpeg = await resolveFfmpeg(options.ffmpegPath || env.FFMPEG_PATH);
   const ffmpegReady = checkFfmpeg(ffmpeg);
-  const providers = options.providers || createProviders(env);
+  const providers = options.providers || [...createProviders(env), await createComfyUIProvider(env, {
+    ffmpeg, generationDir, workflowPath: join(root, 'comfyui-h3.api.json'),
+  })];
   const exports = new Map();
   const generations = new Map();
   const controllers = new Set();
@@ -135,7 +139,12 @@ export async function createAppServer(options = {}) {
       const pathname = decodeURIComponent(url.pathname);
       const method = request.method;
       if (pathname === '/api/health' && method === 'GET') return json(response, 200, { ok: true, ffmpegAvailable: await ffmpegReady });
-      if (pathname === '/api/providers' && method === 'GET') return json(response, 200, { providers: providers.map(p => ({ id: p.id, name: p.name, description: p.description, configured: Boolean(p.configured()) })) });
+      if (pathname === '/api/providers' && method === 'GET') {
+        return json(response, 200, { providers: providers.map(p => ({
+          id: p.id, name: p.name, description: p.description, configured: Boolean(p.configured()),
+          acceptsReferenceImage: p.acceptsReferenceImage,
+        })) });
+      }
       if (pathname === '/api/exports' && method === 'GET') return json(response, 200, { exports: [...exports.values()].filter(item => item.status === 'completed').sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(publicExport) });
       if (pathname === '/api/exports' && method === 'POST') {
         const input = validateExport(await readJson(request));
@@ -186,10 +195,11 @@ export async function createAppServer(options = {}) {
         const input = await readJson(request);
         const provider = providers.find(p => p.id === input.provider);
         fail(!provider, '生成服务不存在。');
-        fail(!provider.configured(), '服务尚未配置，请先设置服务端环境变量。');
+        fail(!provider.configured(), `服务尚未配置。${provider.description || ''}`);
         const exported = exports.get(input.exportId);
         fail(!exported || exported.status !== 'completed', '请先完成深度视频导出。');
         fail(typeof input.prompt !== 'string' || input.prompt.trim().length < 1 || input.prompt.length > 10000, '请输入 1–10000 字符的提示词。');
+        fail(input.referenceImageUrl && provider.acceptsReferenceImage === false, '当前生成服务只接收深度视频和提示词。');
         fail(input.referenceImageUrl && !isHttpUrl(input.referenceImageUrl), '参考图片地址必须是 HTTP 或 HTTPS URL。');
         fail(input.seed !== undefined && (!Number.isSafeInteger(input.seed) || input.seed < 0 || input.seed > 4294967295), 'seed 必须是 0–4294967295 的整数。');
         fail([...generations.values()].filter(g => ['queued', 'running'].includes(g.status)).length >= 4, '同时生成的任务过多。', 429);
@@ -197,13 +207,13 @@ export async function createAppServer(options = {}) {
         generations.set(job.id, job);
         const controller = new AbortController();
         controllers.add(controller);
-        const timer = setTimeout(() => controller.abort(), 15 * 60 * 1000);
+        const timer = setTimeout(() => controller.abort(new Error('生成任务等待超时。')), provider.timeoutMs ?? 15 * 60 * 1000);
         timer.unref();
         setImmediate(async () => {
           job.status = 'running';
           try {
-            Object.assign(job, await provider.generate({ exported, input, signal: controller.signal }), { status: 'completed', completedAt: new Date().toISOString() });
-          } catch (error) { job.status = 'failed'; job.error = redactError(error, env); }
+            Object.assign(job, await provider.generate({ exported, input, jobId: job.id, signal: controller.signal }), { status: 'completed', completedAt: new Date().toISOString() });
+          } catch (error) { job.status = 'failed'; job.error = redactError(controller.signal.aborted ? controller.signal.reason : error, env); }
           finally { clearTimeout(timer); controllers.delete(controller); }
         });
         return json(response, 202, { ...job });
@@ -217,6 +227,10 @@ export async function createAppServer(options = {}) {
       if (pathname.startsWith('/api/')) throw new ApiError(404, '接口不存在。');
       if (pathname.startsWith('/artifacts/')) {
         fail(!['GET', 'HEAD'].includes(method), '不支持的请求方法。', 405);
+        const generatedVideo = /^\/artifacts\/generations\/([0-9a-f-]+)\.mp4$/.exec(pathname);
+        if (generatedVideo && idPattern.test(generatedVideo[1])) {
+          return await sendFile(request, response, join(generationDir, `${generatedVideo[1]}.mp4`));
+        }
         const artifact = /^\/artifacts\/([0-9a-f-]+)\/(depth\.mp4|metadata\.json|frames\/\d{5}\.png)$/.exec(pathname);
         fail(!artifact || !idPattern.test(artifact[1]), '文件不存在。', 404);
         return await sendFile(request, response, join(exportDir, artifact[1], artifact[2]));

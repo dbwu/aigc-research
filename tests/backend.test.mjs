@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import { createAppServer } from '../server/server.mjs';
 import { resolveFfmpeg, checkFfmpeg } from '../server/encoder.mjs';
 import { createProviders, redactError } from '../server/providers.mjs';
+import http from 'node:http';
 
 const run = promisify(execFile);
 function crc32(buffer) {
@@ -120,6 +121,7 @@ test('validates settings and refuses cross-origin writes and traversal', async t
   const providers = await (await fetch(base + '/api/providers')).json();
   assert.equal(providers.providers.find(p => p.id === 'mock').configured, true);
   assert.equal(providers.providers.find(p => p.id === 'fal').configured, false);
+  assert.equal(providers.providers.find(p => p.id === 'comfyui').configured, false);
   assert.equal((await post(base, '/api/generations', { provider: 'fal', exportId: 'bad', prompt: 'test' })).status, 400);
 });
 
@@ -130,7 +132,6 @@ test('provider failures do not expose configured credentials', () => {
 });
 
 test('HTTP adapter accepts a local replacement provider with multipart contract', async t => {
-  const http = await import('node:http');
   let captured;
   const upstream = http.createServer(async (req, res) => {
     const parts = []; for await (const part of req) parts.push(part);
@@ -140,7 +141,6 @@ test('HTTP adapter accepts a local replacement provider with multipart contract'
   });
   upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
   t.after(() => new Promise(resolve => upstream.close(resolve)));
-  const { writeFile } = await import('node:fs/promises');
   const directory = await mkdtemp(join(tmpdir(), 'spatial-provider-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const videoPath = join(directory, 'depth.mp4'); await writeFile(videoPath, 'local test bytes');
@@ -151,4 +151,132 @@ test('HTTP adapter accepts a local replacement provider with multipart contract'
   assert.match(captured.headers['content-type'], /^multipart\/form-data;/);
   assert.match(captured.body, /name="video"; filename="depth.mp4"/);
   assert.match(captured.body, /linear-camera-z-near-white-far-black/);
+});
+
+test('ComfyUI bridges depth frames and prompt to H3 and serves the completed MP4', { timeout: 15000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'spatial-comfyui-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const exportId = 'd9536431-914d-4944-9c9a-baf039092f8e';
+  const exportDir = join(directory, 'exports', exportId);
+  await mkdir(exportDir, { recursive: true });
+  const ffmpeg = await resolveFfmpeg();
+  const depthPath = join(exportDir, 'depth.mp4');
+  const resultPath = join(directory, 'result.mp4');
+  await Promise.all([
+    writeFile(join(exportDir, 'metadata.json'), JSON.stringify({
+      ...spec, id: exportId, status: 'completed', numFrames: 81,
+    })),
+    run(ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', 'color=gray:s=32x24:r=16', '-frames:v', '81', depthPath]),
+    run(ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', 'color=red:s=32x24:r=24', '-frames:v', '4', resultPath]),
+  ]);
+  const resultBytes = await readFile(resultPath);
+  const workflowPath = join(directory, 'comfyui.api.json');
+  const node = (class_type, inputs) => ({ class_type, inputs });
+  await writeFile(workflowPath, JSON.stringify({
+    '10': node('LoadVideo', { file: 'placeholder.mp4' }),
+    '11': node('DemoPosePreprocessor', { video: ['10', 0] }),
+    '12': node('MiniMaxH3FunControlNetApply', { control_video: ['11', 0] }),
+    '13:1': node('MiniMaxH3ReferenceToVideo', { prompt: ['14', 0], length: ['15', 0] }),
+    '14': node('PrimitiveStringMultiline', { value: 'Old prompt' }),
+    '15': node('PrimitiveInt', { value: 5 }),
+    '16': node('RandomNoise', { noise_seed: 11 }),
+    '17': node('SamplerCustomAdvanced', { model: ['12', 0], latent: ['13:1', 1], noise: ['16', 0] }),
+    '18': node('SaveVideo', { video: ['17', 0], format: 'mp4' }),
+    '19': node('PreviewImage', { images: ['11', 0] }),
+  }));
+  const captured = { submissions: [], auth: [], logs: [], historyReads: 0 };
+  const upstream = http.createServer(async (req, res) => {
+    try {
+      captured.auth.push(req.headers.authorization);
+      const url = new URL(req.url, 'http://localhost');
+      const send = payload => res.setHeader('Content-Type', 'application/json').end(JSON.stringify(payload));
+      if (url.pathname === '/comfy/upload/image') {
+        const parts = [];
+        for await (const part of req) parts.push(part);
+        const form = await new Response(Buffer.concat(parts), { headers: { 'Content-Type': req.headers['content-type'] } }).formData();
+        const video = form.get('image');
+        captured.upload = { type: form.get('type'), name: video.name, mime: video.type };
+        await writeFile(join(directory, 'uploaded.mp4'), Buffer.from(await video.arrayBuffer()));
+        return send({ name: 'uploaded depth.mp4', subfolder: '', type: 'input' });
+      }
+      if (url.pathname === '/comfy/prompt') {
+        const parts = [];
+        for await (const part of req) parts.push(part);
+        captured.submissions.push(JSON.parse(Buffer.concat(parts)));
+        return send({ prompt_id: `test-${captured.submissions.length}` });
+      }
+      if (url.pathname === '/comfy/history/test-1') {
+        if (++captured.historyReads === 1) return send({});
+        return send({ 'test-1': {
+          status: { status_str: 'success', completed: true },
+          outputs: { '18': { images: [{ filename: 'H3 test.mp4', subfolder: 'video/run', type: 'output' }] } },
+        } });
+      }
+      if (url.pathname === '/comfy/history/test-2') return send({ 'test-2': {
+        status: { status_str: 'error', messages: [['execution_error', { exception_message: '模型加载失败 test-comfy-token' }]] },
+      } });
+      if (url.pathname === '/comfy/view') {
+        captured.view = Object.fromEntries(url.searchParams);
+        res.setHeader('Content-Type', 'video/mp4').end(resultBytes);
+        return;
+      }
+      res.writeHead(404).end();
+    } catch (error) {
+      captured.logs.push(error.message);
+      res.writeHead(500).end();
+    }
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+  const { base } = await setup(t, { dataDir: directory, env: {
+    COMFYUI_URL: `http://127.0.0.1:${upstream.address().port}/comfy`,
+    COMFYUI_WORKFLOW_PATH: workflowPath,
+    COMFYUI_API_KEY: 'test-comfy-token',
+  } });
+  const providers = (await (await fetch(base + '/api/providers')).json()).providers;
+  assert.equal(providers.find(p => p.id === 'comfyui')?.configured, true);
+  const input = { provider: 'comfyui', exportId, prompt: '两个人在桌旁交谈', seed: 31 };
+  assert.equal((await post(base, '/api/generations', { ...input, referenceImageUrl: 'https://example.com/face.png' })).status, 400);
+  async function submitJob() {
+    const response = await post(base, '/api/generations', input);
+    assert.equal(response.status, 202, await response.clone().text());
+    let job = await response.json();
+    for (let i = 0; i < 200 && ['queued', 'running'].includes(job.status); i++) {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      job = await (await fetch(base + `/api/generations/${job.id}`)).json();
+    }
+    return job;
+  }
+  const job = await submitJob();
+  assert.equal(job.status, 'completed', job.error);
+  assert.equal(job.requestId, 'test-1');
+  assert.match(job.videoUrl, /^\/artifacts\/generations\/.+\.mp4$/);
+  assert.equal(captured.historyReads, 2);
+  assert.equal(captured.upload.mime, 'video/mp4');
+  assert.equal(captured.upload.type, 'input');
+  assert.match(captured.upload.name, /^spatial-depth-.+\.mp4$/);
+  const graph = captured.submissions[0].prompt;
+  assert.equal(graph['10'].inputs.file, 'uploaded depth.mp4');
+  assert.equal(graph['11'], undefined);
+  assert.equal(graph['19'], undefined);
+  const [decoder, port] = graph['12'].inputs.control_video;
+  assert.equal(port, 0);
+  assert.deepEqual(graph[decoder], node('GetVideoComponents', { video: ['10', 0] }));
+  assert.deepEqual(graph['13:1'].inputs, { prompt: input.prompt, length: 124 });
+  assert.equal(graph['16'].inputs.noise_seed, 31);
+  assert.deepEqual(captured.view, { filename: 'H3 test.mp4', subfolder: 'video/run', type: 'output' });
+  const { stdout, stderr } = await run(ffmpeg, ['-hide_banner', '-i', join(directory, 'uploaded.mp4'), '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'], { encoding: 'buffer' });
+  assert.match(stderr.toString(), /24 fps/);
+  assert.equal(stdout.length, 124 * 32 * 24);
+  const video = await fetch(base + job.videoUrl, { headers: { Range: 'bytes=0-31' } });
+  assert.equal(video.status, 206);
+  assert.equal(video.headers.get('content-type'), 'video/mp4');
+  assert.deepEqual(Buffer.from(await video.arrayBuffer()), resultBytes.subarray(0, 32));
+  const failed = await submitJob();
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /模型加载失败 \[redacted\]/);
+  assert.ok(captured.auth.every(value => value === 'Bearer test-comfy-token'));
+  assert.deepEqual(captured.logs, []);
+  assert.deepEqual(await readdir(join(directory, 'generations')), [`${job.id}.mp4`]);
 });
